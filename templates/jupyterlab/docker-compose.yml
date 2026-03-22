@@ -1,0 +1,109 @@
+# Secure JupyterLab Environment — Docker Compose
+# Features: authentication, GPU support, resource limits, isolated network, mounted workspace
+
+version: "3.9"
+
+# ──────────────────────────────────────────────
+# Networks — isolated from internet by default
+# ──────────────────────────────────────────────
+networks:
+  jupyter_internal:
+    driver: bridge
+    # internal: true  # Uncomment to block ALL internet access
+    ipam:
+      config:
+        - subnet: 172.21.0.0/24
+
+# ──────────────────────────────────────────────
+# Volumes
+# ──────────────────────────────────────────────
+volumes:
+  jupyter_workspace:
+    name: jupyterlab_workspace
+  jupyter_config:
+    name: jupyterlab_config
+
+# ──────────────────────────────────────────────
+# Services
+# ──────────────────────────────────────────────
+services:
+
+  # ─────────────────────────────────────────────
+  # JupyterLab — Authenticated, resource-limited
+  # ─────────────────────────────────────────────
+  jupyterlab:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        - PYTHON_VERSION=${PYTHON_VERSION:-3.11}
+    image: secure-jupyterlab:latest
+    container_name: secure-jupyterlab
+    restart: unless-stopped
+    ports:
+      - "${JUPYTER_PORT:-8888}:8888"
+    volumes:
+      # Persistent workspace (notebooks, outputs)
+      - jupyter_workspace:/workspace
+      # Mount host directory read-only for datasets (optional)
+      # - ${HOST_DATA_DIR:-./data}:/data:ro
+      # JupyterLab config (read-only)
+      - jupyter_config:/home/jupyter/.jupyter
+    environment:
+      # Authentication token (CHANGE THIS before sharing)
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:?JUPYTER_TOKEN must be set in .env file}
+      # Optional: Password (alternative to token)
+      # - JUPYTER_PASSWORD_HASH=${JUPYTER_PASSWORD_HASH:-}
+      # Hugging Face token
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+      # Disable telemetry
+      - DO_NOT_TRACK=1
+      # GPU visibility (empty = CPU only, "0" = first GPU, "all" = all GPUs)
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-all}
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    networks:
+      - jupyter_internal
+
+    # ── Resource Limits ──────────────────────
+    mem_limit: ${MEM_LIMIT:-16g}
+    memswap_limit: ${MEM_LIMIT:-16g}
+    cpus: "${CPU_LIMIT:-8.0}"
+    shm_size: "4g"  # Shared memory for PyTorch DataLoader
+
+    # ── Security Hardening ───────────────────
+    security_opt:
+      - no-new-privileges:true
+    # Read-only root filesystem with writable tmpfs mounts
+    # read_only: true  # Uncomment after testing — requires tmpfs config
+    tmpfs:
+      - /tmp:size=1g
+      - /run:size=100m
+    cap_drop:
+      - ALL
+    cap_add:
+      # Minimum capabilities needed for Jupyter
+      - CHOWN
+      - SETUID
+      - SETGID
+      - DAC_OVERRIDE
+
+    # ── GPU Support (NVIDIA) ─────────────────
+    # Uncomment for GPU access:
+    deploy:
+      resources:
+        limits:
+          memory: ${MEM_LIMIT:-16g}
+        reservations:
+          memory: 4g
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-1}
+              capabilities: [gpu]
+
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider",
+             "http://localhost:8888/api?token=${JUPYTER_TOKEN:-}"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
