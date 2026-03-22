@@ -1,0 +1,171 @@
+# Local AI Sandbox — Docker Compose
+# Includes: Ollama (LLM runtime), Open WebUI (chat UI), JupyterLab (notebooks)
+# Usage:
+#   CPU mode:  docker compose up -d
+#   GPU mode:  docker compose --profile gpu up -d
+
+version: "3.9"
+
+# ──────────────────────────────────────────────
+# Networks
+# ──────────────────────────────────────────────
+networks:
+  sandbox_net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+# ──────────────────────────────────────────────
+# Volumes — persist data between restarts
+# ──────────────────────────────────────────────
+volumes:
+  ollama_models:
+    name: sandbox_ollama_models
+  open_webui_data:
+    name: sandbox_webui_data
+  jupyter_work:
+    name: sandbox_jupyter_work
+
+# ──────────────────────────────────────────────
+# Services
+# ──────────────────────────────────────────────
+services:
+
+  # ─────────────────────────────────────────────
+  # Ollama — Local LLM Runtime (CPU mode, default)
+  # ─────────────────────────────────────────────
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-1}
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-1}
+      - OLLAMA_FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-1}
+    networks:
+      - sandbox_net
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # ─────────────────────────────────────────────
+  # Ollama — GPU-enabled variant (activate with --profile gpu)
+  # ─────────────────────────────────────────────
+  ollama-gpu:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    profiles:
+      - gpu
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_models:/root/.ollama
+    environment:
+      - OLLAMA_NUM_PARALLEL=${OLLAMA_NUM_PARALLEL:-2}
+      - OLLAMA_MAX_LOADED_MODELS=${OLLAMA_MAX_LOADED_MODELS:-2}
+      - OLLAMA_FLASH_ATTENTION=${OLLAMA_FLASH_ATTENTION:-1}
+    networks:
+      - sandbox_net
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${NVIDIA_GPU_COUNT:-1}
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ─────────────────────────────────────────────
+  # Open WebUI — Browser-based chat interface
+  # ─────────────────────────────────────────────
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: open-webui
+    restart: unless-stopped
+    ports:
+      - "${WEBUI_PORT:-3000}:8080"
+    volumes:
+      - open_webui_data:/app/backend/data
+    environment:
+      # Point to Ollama service (use service name for Docker networking)
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-change-me-in-production}
+      # Disable open registration in shared environments
+      - ENABLE_SIGNUP=${ENABLE_SIGNUP:-true}
+      # Optional: Connect to OpenAI API as well
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_API_BASE_URL=${OPENAI_API_BASE_URL:-https://api.openai.com/v1}
+    networks:
+      - sandbox_net
+    depends_on:
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # ─────────────────────────────────────────────
+  # JupyterLab — Interactive notebook environment
+  # ─────────────────────────────────────────────
+  jupyterlab:
+    image: quay.io/jupyter/scipy-notebook:2024-09-02
+    container_name: jupyterlab
+    restart: unless-stopped
+    ports:
+      - "${JUPYTER_PORT:-8888}:8888"
+    volumes:
+      - jupyter_work:/home/jovyan/work
+      # Mount local notebooks directory (read-write)
+      - ./notebooks:/home/jovyan/notebooks
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - JUPYTER_TOKEN=${JUPYTER_TOKEN:-sandbox}
+      # Allow all origins (set specific origins in production)
+      - JUPYTER_ALLOW_ORIGIN=${JUPYTER_ALLOW_ORIGIN:-*}
+      # Ollama endpoint available from notebooks
+      - OLLAMA_BASE_URL=http://ollama:11434
+      # Optional: Hugging Face token for model downloads
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN:-}
+    networks:
+      - sandbox_net
+    # Resource limits — prevent runaway notebooks from consuming all memory
+    mem_limit: ${JUPYTER_MEM_LIMIT:-8g}
+    memswap_limit: ${JUPYTER_MEM_LIMIT:-8g}
+    cpus: ${JUPYTER_CPU_LIMIT:-4.0}
+    command: >
+      start-notebook.py
+      --NotebookApp.token='${JUPYTER_TOKEN:-sandbox}'
+      --NotebookApp.ip='0.0.0.0'
+      --NotebookApp.allow_origin='*'
+      --NotebookApp.open_browser=False
+    # Install additional AI packages on startup
+    # Uncomment to add: pip install langchain ollama transformers etc.
+    # user: root
+    # entrypoint: >
+    #   bash -c "pip install -q langchain langchain-ollama transformers accelerate &&
+    #            start-notebook.py --NotebookApp.token='${JUPYTER_TOKEN:-sandbox}'"
+    depends_on:
+      - ollama
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8888/api"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
